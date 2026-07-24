@@ -1,0 +1,32 @@
+torch>=2.1
+numpy>=1.24
+scipy>=1.11
+wfdb>=4.1
+h5py>=3.9
+scikit-learn>=1.3
+PyYAML>=6.0
+matplotlib>=3.7
+openpyxl>=3.1
+tqdm>=4.66
+imbalanced-learn>=0.11
+
+# optional: enables the advisory free-RAM heads-up in src/preprocessing/hdf5.py
+# and the memory-budget check in src/dataset/imbalance.py. Both fall back to
+# skipping the check (not to failing) if this isn't installed.
+psutil>=5.9
+
+# export extras (install separately: pip install -r requirements-export.txt)
+# onnx>=1.15
+# onnx2tf
+# tensorflow>=2.15
+
+# optional: enables MEASURED (not estimated) energy-per-inference via Intel
+# RAPL counters in src/training/metrics.py::measure_or_estimate_energy.
+# Only works on Linux with an Intel CPU and RAPL access (often needs root or
+# a udev rule) - silently falls back to the estimated figure if unavailable.
+# pyRAPL>=0.2
+
+# optional: whole-process (incl. native/C extension) CPU flamegraphs for
+# scripts/profile_pipeline.py, e.g. `py-spy record -o profile.svg -- python -m scripts.profile_pipeline`
+# py-spy>=0.3
+

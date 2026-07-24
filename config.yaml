@@ -1,0 +1,288 @@
+# =============================================================================
+# LAFNet-ECG-AF :: master configuration
+# Every tunable lives here. Nothing in src/ should hardcode these values.
+# =============================================================================
+
+project:
+  name: "LAFNet"
+  full_name: "Lightweight Atrial-Fibrillation Network"
+  seed: 42
+
+data:
+  wfdb_root: "data/WFDB"
+  hdf5_path: "data/lafnet_dataset.h5"
+  # "lzf" | null. LZF is much faster than gzip on both write (build) and,
+  # critically, on the random single-row reads a shuffled DataLoader issues
+  # every step during training - gzip's higher compression ratio isn't worth
+  # the CPU spent inflating every batch on an 8 vCPU CPU-only box. Set to
+  # null for zero compression (fastest reads, largest file) if disk space
+  # isn't a constraint.
+  hdf5_compression: "lzf"
+  # h5py raw chunk cache per open file handle (bytes) - each DataLoader worker
+  # opens its own file handle, so this is "per worker", not global. Sized well
+  # above one batch's worth of windows so repeated epoch passes hit the HDF5
+  # chunk cache instead of re-reading/re-decompressing from disk every time.
+  hdf5_cache_bytes: 268435456   # 256 MB
+  hdf5_cache_slots: 15013       # prime, per h5py docs, for good cache-slot hashing
+  datasets:
+    # Each entry = one PhysioNet Open Access S3 source, ECG-only, WFDB format.
+    - name: "afdb"
+      s3_uri: "s3://physionet-open/afdb/1.0.0/"
+      local_dir: "data/WFDB/afdb"
+      fs_native: 250
+      ecg_channel: 0          # lead to use if a record has 2 ECG leads
+      # 04043 / 04048 ship without rhythm annotations on PhysioNet - always excluded
+      exclude_records: ["04043", "04048"]
+    - name: "ltafdb"
+      s3_uri: "s3://physionet-open/ltafdb/1.0.0/"
+      local_dir: "data/WFDB/ltafdb"
+      fs_native: 128
+      ecg_channel: 0
+      exclude_records: []
+    - name: "shdb-af"
+      s3_uri: "s3://physionet-open/shdb-af/1.0.1/"
+      local_dir: "data/WFDB/shdb-af-1.0.1"
+      fs_native: 200
+      ecg_channel: 0
+      exclude_records: []
+    - name: "shdb-af-legacy"
+      s3_uri: "s3://physionet-open/shdb-af/1.0.0/"
+      local_dir: "data/WFDB/shdb-af-1.0.0"
+      fs_native: 200
+      ecg_channel: 0
+      # 1.0.1 supersedes 1.0.0; kept only if the user explicitly wants it too.
+      enabled: false
+      exclude_records: []
+
+preprocessing:
+  target_fs: 128              # every record resampled to this rate before windowing
+  filter:
+    type: "butterworth"       # butterworth | bessel | cheby1 | elliptic | fir
+    order: 4
+    lowcut_hz: 0.5
+    highcut_hz: 40.0
+    notch_hz: 60.0
+    notch_q: 30.0
+  quality:
+    max_flat_seconds: 1.0
+    clip_fraction_threshold: 0.02
+    min_sqi: 0.5
+  normalization:
+    method: "zscore"          # zscore | minmax | robust | decimal
+  windows:
+    length_seconds: 10.0      # AF episodes run longer than heart-sound cycles,
+                               # so ECG-only windows are wider than the old 5 s ECG+PCG windows
+    overlap: 0.5
+    af_positive_fraction: 0.5 # window labeled AF if >= this fraction of samples are inside an AF interval
+    reject_if_below_min_quality: true
+
+labels:
+  mode: "binary"               # binary (AF vs Non-AF) is the only mode - single rhythm axis
+  af_aux_tokens: ["(AFIB", "(AFL"]   # rhythm annotation tokens treated as positive
+  non_af_aux_tokens: ["(N", "(J", "(SVTA", "(B", "(T", "(IVR", "(VT"]
+
+dataset_split:
+  train_frac: 0.7
+  val_frac: 0.15
+  test_frac: 0.15
+  split_by: "subject"          # subject-wise split, never window-wise (no leakage)
+
+sampler:
+  imbalance_strategy: "weighted_sampler"   # weighted_sampler | smote | none - ablation.imbalance_strategy sweeps this
+  smote_k_neighbors: 5
+
+augment:
+  enabled: true
+  noise_std: 0.01
+  shift_max_frac: 0.1
+  scale_range: [0.9, 1.1]
+  stretch_range: [0.95, 1.05]
+  crop_frac: 0.9
+  mixup_alpha: 0.2
+  # How many augmented copies of each TRAIN-split window to generate once,
+  # up front, via `python -m src.preprocessing.augment_store` (run right
+  # after src.preprocessing.hdf5), instead of re-running these augmentation
+  # functions live inside __getitem__ on every window on every one of
+  # training.epochs passes. Stored in the HDF5 file's "/augmented" group.
+  # Set to 0 to disable precomputation and fall back to the original
+  # on-the-fly per-epoch augmentation in src/dataset/loader.py.
+  copies_per_train_window: 1
+
+model:
+  name: "LAFNet"
+  num_classes: 2
+  in_channels: 1
+  stem_kernel_sizes: [3, 7, 15]
+  stem_out_channels: 16
+  residual_blocks: 4
+  residual_channels: 24
+  se_reduction: 4
+  attention_dim: 32            # lightweight self-attention over pooled temporal tokens
+  attention_heads: 1
+  classifier_hidden: 24
+  dropout: 0.2
+  use_se: true                 # ablation toggle: Squeeze-Excitation on/off
+  use_attention: true          # ablation toggle: temporal self-attention on/off
+
+training:
+  epochs: 100
+  # Bumped from 128 -> 512 now that the target box has 64GB RAM (see
+  # hardware.* below): a single-lead 10s @128Hz window is tiny (~5KB as
+  # float32), so 512 rows/batch is still a trivial slice of RAM, and fewer,
+  # larger batches means fewer Python-level iteration/dispatch overheads per
+  # epoch on a CPU-only box where that overhead is a bigger fraction of
+  # total step time than it would be on a GPU.
+  batch_size: 512
+  optimizer: "adamw"
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 3
+  loss: "focal"                 # cross_entropy | label_smoothing | focal
+  label_smoothing: 0.05
+  focal_gamma: 2.0
+  early_stopping_patience: 12
+  early_stopping_metric: "val_mcc"
+  grad_clip_norm: 1.0
+  num_workers: 7                 # capped at runtime to min(this, hardware.vcpus - 1, os.cpu_count())
+  persistent_workers: true       # keep worker processes (+ their open HDF5 handles) alive across epochs
+  prefetch_factor: 4              # batches queued ahead per worker, to keep all 7 workers' CPU cores fed
+  device: "auto"                # auto | cpu | cuda - stays "auto" so this also works unchanged on a GPU box
+
+# =============================================================================
+# Hardware profile for the target machine (8 vCPU / 64 GB RAM, CPU-only EC2,
+# e.g. r5.2xlarge / r6i.2xlarge class - memory-optimized, since RAM is no
+# longer the constraint once preprocessing streams instead of accumulating).
+# src/ code reads this section to stay memory-safe AND to keep the CPU-bound
+# pipeline (no GPU to offload to) fully utilized rather than idling on I/O:
+#   - DataLoader num_workers is capped to hardware.vcpus - 1 (leaves 1 core for
+#     the main process / OS), never just training.num_workers blindly.
+#   - src/preprocessing/hdf5.py streams windows straight into the resizable
+#     HDF5 dataset via a small flush buffer (hardware.hdf5_flush_rows) as
+#     they're produced by src/preprocessing/windows.py's generator, instead of
+#     collecting every window of a record (or worse, every record) into a
+#     Python list before writing - LTAFDB's day-plus recordings alone can
+#     produce tens of thousands of windows per record.
+#   - src/dataset/imbalance.py's SMOTE path estimates the in-memory size of
+#     the materialized training split before running SMOTE (which needs the
+#     WHOLE split as a dense array) and falls back to weighted_sampler with a
+#     clear warning instead of risking an OOM kill if it would exceed
+#     hardware.max_smote_ram_gb.
+# =============================================================================
+hardware:
+  vcpus: 8
+  ram_gb: 64
+  max_smote_ram_gb: 16.0         # SMOTE materializes the whole train split as one dense array
+  max_hdf5_build_ram_gb: 4.0     # soft budget check before the incremental HDF5 build starts
+  # Row-group size used both for HDF5 chunk shape and for how many windows the
+  # streaming writer buffers in Python before flushing to disk. Bigger chunks
+  # than the old 256 cut per-flush syscall/HDF5-metadata overhead without ever
+  # holding more than this many windows' worth of an in-progress record in RAM.
+  hdf5_chunk_rows: 1024
+  hdf5_flush_rows: 1024
+
+paths:
+  outputs_dir: "outputs"
+  plots_dir: "outputs/plots"
+  weights_dir: "weights"
+  logs_dir: "logs"
+  report_xlsx: "outputs/lafnet_report.xlsx"
+  test_report_json: "outputs/test_report.json"
+
+export:
+  onnx_path: "outputs/lafnet.onnx"
+  opset: 17
+  tflite_float_path: "outputs/lafnet_float.tflite"
+  tflite_int8_path: "outputs/lafnet_int8.tflite"
+  representative_samples: 200
+
+# =============================================================================
+# Research validation add-ons: ablations, cross-database generalization,
+# complexity/energy profiling, and statistical validation.
+# =============================================================================
+
+ablation:
+  # Each axis is swept independently (one-factor-at-a-time), holding every
+  # other setting at its config.yaml default, unless `full_grid: true`, in
+  # which case the Cartesian product of all axes is run (expensive).
+  full_grid: false
+  epochs_override: 25          # shorter runs for ablation sweeps; set null to use training.epochs
+  axes:
+    filter_type: ["butterworth", "bessel", "cheby1", "fir"]
+    window_seconds: [5.0, 10.0, 15.0]
+    use_attention: [true, false]
+    use_se: [true, false]
+    imbalance_strategy: ["smote", "weighted_sampler"]
+  results_csv: "outputs/ablation_results.csv"
+  results_xlsx: "outputs/ablation_report.xlsx"
+
+cross_database:
+  # Train on one database, evaluate (zero-shot, no fine-tuning) on the others,
+  # to measure how well AF/Non-AF rhythm patterns generalize across recording
+  # hardware/populations rather than just across held-out subjects of the
+  # same database.
+  train_on: ["afdb"]
+  test_on: ["ltafdb", "shdb-af"]
+  epochs_override: null        # null = use training.epochs
+  results_json: "outputs/cross_database_results.json"
+
+cross_validation:
+  n_folds: 5
+  split_by: "subject"           # GroupKFold on subject id - never window-wise
+  epochs_override: 40
+  confidence_level: 0.95
+  bootstrap_iterations: 2000
+  results_json: "outputs/cross_validation_results.json"
+  results_xlsx: "outputs/cross_validation_report.xlsx"
+
+statistics:
+  # Used to compare two trained variants (e.g. attention vs no-attention,
+  # or LAFNet vs a saved baseline checkpoint) on the same held-out predictions.
+  mcnemar_correction: true       # continuity-corrected McNemar's test
+  bootstrap_iterations: 2000
+  confidence_level: 0.95
+
+complexity:
+  # Model-complexity + energy profiling knobs for src/training/metrics.py
+  latency_runs: 100
+  latency_warmup: 5
+  measure_gpu: false             # target instance (8 vCPU/32GB) has no GPU; flip to true if you move to a GPU box - auto no-ops if torch.cuda.is_available() is False either way
+  energy:
+    # No physical power meter is available in most environments, so energy is
+    # reported two ways: (a) a MEASURED figure via Intel RAPL through the
+    # `pyRAPL` package when running on supported Linux/Intel CPUs (AWS's
+    # Intel-based instance families expose this), and (b) an ESTIMATED figure
+    # from a simple energy-per-MAC constant when RAPL isn't available.
+    # Estimated figures are always clearly labeled as such.
+    prefer_measured: true
+    fallback_pj_per_mac_cpu: 20.0   # rough literature figure for FP32 CPU inference, pJ/MAC
+    fallback_pj_per_mac_int8: 1.0   # rough literature figure for INT8 embedded inference, pJ/MAC
+
+# =============================================================================
+# AWS: S3 locations + EC2 launch settings, sized for a single 8 vCPU / 32 GB
+# CPU-only instance (m5.2xlarge / c5.2xlarge / m6i.2xlarge class). Nothing
+# under src/ reads this section directly except scripts/aws/*.py - the core
+# pipeline (preprocessing/training/export) is unchanged and runs identically
+# on a laptop or an EC2 instance, operating purely on local paths.
+# =============================================================================
+
+aws:
+  region: "us-east-1"
+  s3_bucket: "my-lafnet-bucket"        # <- change to a bucket you own
+  s3_prefix: "lafnet-ecg-af"           # everything is namespaced under s3://<bucket>/<prefix>/...
+  s3_paths:
+    raw_data: "data/WFDB"              # s3://<bucket>/<prefix>/data/WFDB/<dataset_name>/...
+    processed_data: "data/processed"   # s3://<bucket>/<prefix>/data/processed/lafnet_dataset.h5
+    checkpoints: "weights"             # s3://<bucket>/<prefix>/weights/...
+    outputs: "outputs"                 # s3://<bucket>/<prefix>/outputs/...
+    logs: "logs"                       # s3://<bucket>/<prefix>/logs/...
+
+  ec2:
+    instance_type: "r5.2xlarge"        # 8 vCPU / 64 GB, matches hardware.* above - no GPU
+    ami_name_filter: "al2023-ami-*-x86_64"   # Amazon Linux 2023, CPU-only, no GPU driver needed
+    key_name: "my-ec2-keypair"          # <- change
+    security_group_ids: []              # <- fill in
+    subnet_id: null                     # <- fill in, or leave null for default VPC
+    spot: true
+    spot_max_price: null                # null = on-demand price cap (safe default)
+    volume_size_gb: 200
